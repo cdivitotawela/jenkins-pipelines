@@ -1,0 +1,64 @@
+node('java') {
+  
+  stage('Checkout') {
+    scmVars = checkout scm
+  }
+
+  stage('Configure') {
+    // Provide the name of the artifactory server configured in Jenkins settings section
+    server1 = Artifactory.server('ArtifactoryServer1')
+    server1.setBypassProxy(true)
+    
+    rtMaven = Artifactory.newMavenBuild()
+    rtMaven.resolver server: server1, releaseRepo: 'libs-release', snapshotRepo: 'libs-snapshot'
+    rtMaven.deployer server: server1, releaseRepo: 'libs-release-local', snapshotRepo: 'libs-snapshot-local'
+    rtMaven.tool = 'Maven 3.3.9'
+    
+    // Buildinfo object to store the store the build 
+    buildInfo = Artifactory.newBuildInfo()
+    
+    // Disable deploying artifacts during the build. Artifacts deployed after code checks.
+    rtMaven.deployer.deployArtifacts = false  
+    
+    // If you need to pusblish artifact to another Artifactory server
+    server2 = Artifactory.server('ArtifactoryServer2')
+    server2.setBypassProxy(true)    
+  }
+  
+  stage('Build') {
+    // Skip unit and integration tests here as those are run in separate stage
+    rtMaven.run pom: 'pom.xml', goals: 'clean install', buildInfo: buildInfo
+    
+    //Note: It has been noted that if you use a variable in goals it throws a cast error. Convert it to string to avoid the problem
+    //rtMaven.run pom: 'pom.xml', goals: "clean install -Dversion=${VERSION}".toString(), buildInfo: buildInfo
+  }
+  
+  stage('Quality') {
+    parallel(
+        'Unit-Tests': {
+          rtMaven.run pom: 'pom.xml', goals: 'test'
+          step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+        },
+        'Analysis': {
+          rtMaven.run pom: 'pom.xml', goals: 'checkstyle:checkstyle pmd:pmd findbugs:findbugs -Dmaven.javadoc.failOnError=false'
+          checkstyle healthy: '100', pattern: '**/target/checkstyle-result.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+          findbugs healthy: '100', pattern: '**/target/findbugsXml.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+          pmd healthy: '100', pattern: '**/target/pmd.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+        }
+    )
+  } 
+  
+  stage ('Publish') {
+    // Publish the artifacts to server1. Excude the deployable artifacts 
+    rtMaven.deployer.artifactDeploymentPatterns.addExclude("*SAMPLE-EAR-*")
+    rtMaven.deployer.deployArtifacts buildInfo
+    
+    // Deploy the artifacts to Server2. Only include the deployable artifacts.
+    rtMaven.deployer server: server2, releaseRepo: 'libs-release-local', snapshotRepo: 'libs-snapshot-local'
+    // Clear existing patterns
+    rtMaven.deployer.artifactDeploymentPatterns.clear()
+    rtMaven.deployer.artifactDeploymentPatterns.addInclude("*SAMPLE-EAR-*")
+    rtMaven.deployer.deployArtifacts buildInfo    
+  }  
+  
+}
