@@ -1,0 +1,98 @@
+def getCurrentPomVersion() {
+  // Parse the pom.xml and return the set version
+  pomVersion = powershell returnStdout: true, script: '''[xml]$pomXml = Get-content pom.xml
+$pomXml.project.properties.revision
+'''
+  return pomVersion.trim()
+}
+
+//Global Variables
+OCTOPUS_SERVER = 'https://octopus.example.com'
+OCTOPUS_PROJECT = 'PROJECTNAME'
+
+node('java && octo') {
+
+  stage('Checkout') {
+    gitVars = checkout scm
+    // Collect the version from pom.xml and Git hash from git variables 
+    VERSION = getCurrentPomVersion()
+    COMMIT_HASH = gitVars.GIT_COMMIT.substring(0, 7)
+    RELEASE = "${VERSION}.${BUILD_NUMBER}+${COMMIT_HASH}"
+    
+    echo "*** Version in POM = ${VERSION}"
+    echo "*** Git Hash = ${COMMIT_HASH}"
+    echo "*** Release Version = ${RELEASE}"
+  }
+ 
+  stage('Configure') {
+    // Configure Artifactory Plugin
+    def server1 = Artifactory.server('ArtifactoryA')
+    def server2 = Artifactory.server('ArtifactoryB')
+    server1.setBypassProxy(true)
+    server2.setBypassProxy(true)
+    
+    // For normal build which publish artefacts to ArtifactoryB 
+    rtMaven = Artifactory.newMavenBuild()
+    rtMaven.resolver server: server1, releaseRepo: 'libs-release', snapshotRepo: 'libs-snapshot'
+    rtMaven.deployer server: server2, releaseRepo: 'libs-release-local', snapshotRepo: 'libs-snapshot-local'
+    rtMaven.tool = 'Maven 3.3.9'
+    
+    // Disable deploying artifacts during the build. Artifacts deployed after code unit tests and quality checks.
+    rtMaven.deployer.deployArtifacts = false 
+    
+    // Buildinfo object to store the store the build 
+    buildInfo = Artifactory.newBuildInfo()    
+  }
+  
+  stage('Build') {
+    rtMaven.run pom: 'pom.xml', goals: "clean install -Drevision=${RELEASE} -Dskip.unit.tests=true -DskipTests javadoc:javadoc javadoc:jar -Dmaven.javadoc.failOnError=false -U".toString(), buildInfo: buildInfo
+  }
+  
+  stage('Test'){
+    rtMaven.run pom: 'pom.xml', goals: 'test'
+    step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+  }
+ 
+  stage ('Analysis') {
+    rtMaven.run pom: 'pom.xml', goals: 'checkstyle:checkstyle pmd:pmd findbugs:findbugs -Dmaven.javadoc.failOnError=false'
+
+    checkstyle healthy: '100', pattern: '**/target/checkstyle-result.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+    findbugs healthy: '100', pattern: '**/target/findbugsXml.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+    pmd healthy: '100', pattern: '**/target/pmd.xml', unHealthy: '90', usePreviousBuildAsReference: true, useStableBuildAsReference: true
+  }
+  
+  /*
+   * Only plublish artefacts if the branch is master or one of hot-fixes
+   */
+  if ( env.BRANCH_NAME == 'master' || env.BRANCH_NAME =~ /^hotfix\//) {
+    stage('Publish') {
+      // Set the build description to the release version
+      currentBuild.description = RELEASE
+
+      // Publish all artefacts to NGI Artifactory. All these artefacts have version with git hash
+      rtMaven.deployer.deployArtifacts buildInfo
+    }
+  
+    stage('Deploy') {
+      // Channel determines which path Octopus deploy will take 
+      CHANNEL = 'Default'
+      ENVIRONMENT = 'DEV'
+      if (env.BRANCH_NAME =~ /^hotfix\//) {
+       CHANNEL = 'Hotfix'
+       ENVIRONMENT = 'MIRROR'
+      }
+     
+      withCredentials([string(credentialsId: 'Octopus_API_Key', variable: 'API_KEY')]) {
+        bat """
+          Y:/Octopus/Octo.exe --create-release --channel "${CHANNEL}" --project "${OCTOPUS_PROJECT}" --releaseNumber "${RELEASE}" --ignoreexisting --server "${OCTOPUS_SERVER}" --apikey "${API_KEY}" --releaseNotes "${OCTOPUS_PROJECT} Build ${RELEASE}" --package "step-name-for-package:${RELEASE}"
+        """
+      }
+      
+      withCredentials([string(credentialsId: 'Octopus_API_Key', variable: 'API_KEY')]) {
+        bat """
+          Y:/Octopus/Octo.exe --deploy-release --project "${OCTOPUS_PROJECT}" --releaseNumber "${RELEASE}" --deployTo "${ENVIRONMENT}" --progress --waitfordeployment --server "${OCTOPUS_SERVER}" --apikey "${API_KEY}"            
+        """   
+      } 
+    }
+  }
+}
